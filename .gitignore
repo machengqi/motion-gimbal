@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Rust / Tauri
+target/
+**/src-tauri/gen/
+
+# Node
+node_modules/
+dist/
+
+# 数据与实验产物（体积大，不入库；复现脚本负责下载/生成）
+data/
+runs/
+*.onnx
+*.pt
+
+# 系统
+.DS_Store
+Thumbs.db
