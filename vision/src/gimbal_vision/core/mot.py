@@ -177,7 +177,13 @@ class Tracker:
         t.edge = self.edge_of(d)
         return t
 
-    def step(self, k, dets_all):
+    def step(self, k, dets_all, bg_shift=None):
+        """走一帧。
+
+        `bg_shift`：外部估计的这一帧背景位移（画面系，px）。给了就用它，否则用
+        「可靠配对位移的中位数」。⚠️ 中位数的前提是**多数候选是静止物体**；
+        候选只框运动区域时（`candidates.motion`）这个前提不成立，必须由外部给。
+        """
         clk, edge_of, margin = self.clk, self.edge_of, self.margin
         max_miss, stitch_gap = self.max_miss, self.stitch_gap
         tracks, next_id, cum = self.tracks, self.next_id, self.cum
@@ -219,7 +225,7 @@ class Tracker:
 
         # ⛔ 镜头切换要重置：签名是「配对率很低」或「位移大到不像物理量」。
         #    不重置的话累计背景位移会被永久污染，之后所有背景系坐标都是错的。
-        cut = bool(shifts) and (
+        cut = bg_shift is None and bool(shifts) and (
             float(np.hypot(*np.median(np.array(shifts), axis=0)))
             > clk.speed_raw(timing.CUT_PPS, k)
             or len(pairs) < CUT_KEEP * max(len(dets), 1)
@@ -230,7 +236,10 @@ class Tracker:
                 tracks.append(self._born(next_id, dd, k))
                 next_id += 1
 
-        if shifts:
+        if bg_shift is not None:
+            last_shift = np.asarray(bg_shift, dtype=float)
+            cum = cum + last_shift
+        elif shifts:
             last_shift = np.median(np.array(shifts), axis=0)
             cum = cum + last_shift
         elif cut:
@@ -292,17 +301,18 @@ class Tracker:
         return row
 
 
-def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty"):
+def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty", shifts=None):
     """离线口径：把 [`Tracker`] 跑一遍。**这里不许有第二份逻辑。**
 
     `obs[k]` 是第 k 帧的检测列表（见 [`Detection`]）。返回逐帧
     `(帧号, {tid: (x, y, vx, vy, hits, missed, edge)}, 累计背景位移)`，
+    `shifts[k]`（可选）是外部估计的第 k 帧背景位移，见 [`Tracker.step`]。
     其中 `(x, y)` 在**背景系**；`(vx, vy)` 的单位随门控模式不同（px/秒 或 px/帧）。
     """
     clk = clock or timing.Clock(len(obs), roi_w=roi[2])
     tk = Tracker(roi, clk, stitch=stitch, min_conf=min_conf, gate=gate)
     for k, dets in enumerate(obs):
-        tk.step(k, dets)
+        tk.step(k, dets, None if shifts is None else shifts[k])
     return tk.history
 
 
