@@ -12,11 +12,11 @@ Discovery via Motion Segmentation*. ACCV 2020。许可证 CC BY 4.0。
 
 # ⚠️ 重复帧
 
-原作者把所有视频统一重采样到 24fps，源帧率更低的视频因此夹着**与上一帧完全相同**
-的复制帧（相邻帧差严格为 0；同一图像的 JPEG 编码是确定的）。它们不是真实的采样
-时刻 ⇒ 做帧率相关的实验前必须识别出来：[`duplicates`] 给出每帧是否为复制帧。
-⚠️ 判据是「完全相同」，不是「差异很小」—— 镜头静止、目标不动时相邻帧差也会很小，
-那是真实采样，不能删。
+原作者把所有视频统一重采样到 24fps，源帧率更低的视频因此夹着复制帧。它们不是
+真实的采样时刻 ⇒ 做帧率相关的实验前必须识别出来：[`duplicates`] 给出每帧是否为复制帧。
+
+判据见 [`DUP_FRAC`]。⚠️ 不能用「平均差异很小」：镜头静止、目标不动时相邻帧的
+平均差异也很低（实测低至 0.08 灰度级），那是真实采样，不能删。
 """
 
 from __future__ import annotations
@@ -32,6 +32,16 @@ import numpy as np
 
 FPS = 24.0
 """MoCA 统一的标称帧率。"""
+
+DUP_FRAC = 0.005
+"""复制帧判据：与上一帧相比，变化超过 2 个灰度级的像素占比低于此值。
+
+2026-10-14 在 10 段视频上看这个占比的分布：完全相同的 199 帧（占比 0）；正常帧
+绝大多数 > 1%；两者之间有一条稀疏的模糊带（1e-5 ~ 5e-3，约 30 帧），其中有按
+6~7 帧周期出现的复制帧（复制后重新编码，只有极少数像素不同），也有 2 帧分不清
+是复制帧还是真实的静止画面。模糊带不到全部帧的 0.1%，判错对结论的影响可以忽略。
+⚠️ 「完全相同」作判据会漏掉重新编码过的复制帧。
+"""
 
 MOTION = {0: "locomotion", 1: "subtle_motion", 2: "still"}
 
@@ -91,15 +101,15 @@ def load(root: Path | None = None) -> dict[str, Sequence]:
 
 
 def duplicates(seq: Sequence, cache_dir: Path | None = None) -> np.ndarray:
-    """每帧是否为「与上一帧完全相同」的复制帧。结果缓存到 `cache_dir`。"""
-    cache = (cache_dir or default_root().parent / "cache") / f"dup_{seq.name}.npy"
+    """每帧是否为复制帧（判据见 [`DUP_FRAC`]）。结果缓存到 `cache_dir`。"""
+    cache = (cache_dir or default_root().parent / "cache") / f"dup{DUP_FRAC:g}_{seq.name}.npy"
     if cache.exists():
         return np.load(cache)
     out = np.zeros(len(seq.frames), dtype=bool)
     prev = None
     for k, p in enumerate(seq.frames):
-        g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
-        if prev is not None and np.array_equal(g, prev):
+        g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE).astype(np.int16)
+        if prev is not None and (np.abs(g - prev) > 2).mean() < DUP_FRAC:
             out[k] = True
         prev = g
     cache.parent.mkdir(parents=True, exist_ok=True)

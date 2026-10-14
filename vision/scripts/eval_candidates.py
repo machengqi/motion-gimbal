@@ -12,7 +12,7 @@
 - **误报**：中心不在真值框内的候选个数（每帧）。
 - **耗时**：候选生成本身的单帧耗时（不含 JPEG 解码）。
 
-重复帧（与上一帧完全相同）先剔除，保留其余帧的真实时间戳 —— 见 `datasets.moca`。
+复制帧先剔除（判据见 `datasets.moca.DUP_FRAC`），保留其余帧的真实时间戳。
 """
 
 from __future__ import annotations
