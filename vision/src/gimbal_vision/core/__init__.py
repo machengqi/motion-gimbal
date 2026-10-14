@@ -9,14 +9,14 @@ from . import controller, mot, saliency, timing
 __all__ = ["controller", "mot", "run", "saliency", "timing"]
 
 
-def run(obs, roi, clock=None):
+def run(obs, roi, clock=None, gate="uncertainty"):
     """跑一整段：跟踪 → 显著性选择 → 平滑瞄准。
 
     `obs[k]` 是第 k 帧的检测列表（见 `mot.Detection`），`roi = (x, y, w, h)`。
     返回逐帧 `(阶段, 瞄准点, tid)`，瞄准点在画面系。
     """
     clk = clock or timing.Clock(len(obs), roi_w=roi[2])
-    hist = mot.track(obs, roi, clock=clk)
+    hist = mot.track(obs, roi, clock=clk, gate=gate)
     seq = mot.fill_gaps(mot.paths(hist), clk.frames_in(timing.FILL_SEC))
     selector, aim = saliency.Selector(clk, roi), controller.Aim(clk)
 

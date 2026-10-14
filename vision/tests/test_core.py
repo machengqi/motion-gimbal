@@ -74,20 +74,35 @@ def test_without_background_compensation_the_wrong_object_is_chosen(scene):
     assert hit_ratio(out, scene) < 0.5
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "2026-10-14 发现：关联闸按「最大速度 × 帧间隔」换算，15Hz 下放宽到 180px，"
-        "超过物体间距 ⇒ 漏检一帧时轨迹改配到相邻物体，背景系里凭空出现位移。"
-        "对照实验：闸固定为 30Hz 时的像素数后 15Hz/10Hz 命中率回到 88~100%。"
-        "待改为基于预测不确定性的门控（见 docs/PLAN.md）。"
-    ),
-)
-def test_parameters_defined_in_time_survive_a_lower_frame_rate(scene):
-    low = subsample(scene, 2)  # 30Hz → 15Hz，时间戳保留真实值
-    out = core.run(low.obs, low.roi, clock=clock_of(low))
-    ratio = hit_ratio(out, low)
-    assert ratio > 0.8, f"15Hz 命中率 {ratio:.1%}"
+def mean_hit(step, gate, seeds=range(5)):
+    """多个随机种子上的平均命中率；`step` 是抽帧步长（2 = 15Hz）。"""
+    rs = []
+    for seed in seeds:
+        low = subsample(make_scene(seed=seed), step)
+        rs.append(hit_ratio(core.run(low.obs, low.roi, clock=clock_of(low), gate=gate), low))
+    return float(np.mean(rs))
+
+
+@pytest.mark.parametrize(("step", "floor"), [(2, 0.8), (3, 0.7)])
+def test_uncertainty_gating_survives_a_lower_frame_rate(step, floor):
+    ratio = mean_hit(step, "uncertainty")
+    assert ratio > floor, f"{30 // step}Hz 命中率 {ratio:.1%}"
+
+
+def test_the_speed_gate_breaks_at_a_lower_frame_rate():
+    """对照组（docs/PLAN.md §6.1）：前期系统的「最大速度 × 帧间隔」闸在 15Hz 下失效。
+
+    保证上一条的通过来自门控方式的改变，而不是场景在低帧率下本来就容易。
+    """
+    assert mean_hit(2, "speed") < 0.5
+
+
+def test_both_gates_agree_at_the_reference_frame_rate(scene):
+    """参考帧率下两种模型等价：改进只在帧率偏离参考值时起作用。"""
+    clk = clock_of(scene)
+    a = core.run(scene.obs, scene.roi, clock=clk, gate="uncertainty")
+    b = core.run(scene.obs, scene.roi, clock=clk, gate="speed")
+    assert hit_ratio(a, scene) == pytest.approx(hit_ratio(b, scene))
 
 
 def test_the_aim_point_moves_with_bounded_acceleration(scene):

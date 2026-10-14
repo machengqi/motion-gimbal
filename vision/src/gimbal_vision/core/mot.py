@@ -39,21 +39,38 @@ CUT_KEEP = 0.35
 """帧间配对率低于这个比例就判「镜头切换」，重置累计背景位移。"""
 
 
+GATES = ("uncertainty", "speed")
+"""关联门控的两种模式。
+
+`uncertainty`（默认）  按真实 `dt` 建模的 Kalman + 马氏距离门控，再叠加物理上限
+`speed`                前期系统的原设计：按帧 Kalman + 「最大速度 × 帧间隔」距离闸。
+                       保留用于消融对照；低帧率下闸宽超过物体间距会抢配邻居（§6.1）
+"""
+
+
 class Track:
     """一条轨迹的恒速 Kalman，在**画面坐标系**里跑。
 
     为什么不在背景系里跑：背景在动时，多数物体在画面里的运动是一致的，
     关联反而最容易；「偏离共同运动」在报告时减掉累计背景位移即可得到。
+
+    两种模型（见 [`GATES`]）：
+    - `dt_aware=True`：速度单位 px/秒，状态转移与过程噪声按真实 `dt` 计算；
+    - `dt_aware=False`：前期系统的按帧模型，速度单位 px/帧，噪声每帧固定。
     """
 
     Q = np.diag([2.0, 2.0, 0.35, 0.35])
+    """按帧模型的过程噪声（每帧）。"""
     R = np.diag([9.0, 9.0])
     """观测噪声（px²）。量级应与检测框心的抖动相符，换检测器后要重新实测。"""
+    H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], float)
 
-    def __init__(self, tid, x, y, area):
+    def __init__(self, tid, x, y, area, dt_aware=True):
         self.id = tid
+        self.dt_aware = dt_aware
         self.x = np.array([x, y, 0.0, 0.0])
-        self.P = np.diag([4.0, 4.0, 100.0, 100.0])
+        vel_var = timing.INIT_VEL_VAR if dt_aware else 100.0
+        self.P = np.diag([4.0, 4.0, vel_var, vel_var])
         self.area = area
         self.age = self.missed = self.hits = 0
         self.last_obs = (x, y)
@@ -66,15 +83,30 @@ class Track:
         （新生轨迹不走 `update()`，漏赋会让依赖它的分支永远不执行且不报错）。
         """
 
-    def predict(self):
-        F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], float)
+    def predict(self, dt=1.0):
+        """`dt` 是距上一帧的秒数；按帧模型忽略它（每帧算一步）。"""
+        if self.dt_aware:
+            F = np.array([[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]], float)
+            # 连续白噪声加速度模型（每轴）+ 位置随机游走
+            q, qp = timing.ACC_PSD, timing.POS_PSD
+            pp, pv, vv = qp * dt + q * dt**3 / 3, q * dt**2 / 2, q * dt
+            Q = np.array([[pp, 0, pv, 0], [0, pp, 0, pv], [pv, 0, vv, 0], [0, pv, 0, vv]])
+        else:
+            F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]], float)
+            Q = self.Q
         self.x = F @ self.x
-        self.P = F @ self.P @ F.T + self.Q
+        self.P = F @ self.P @ F.T + Q
         self.age += 1
         self.missed += 1
 
+    def mahal2(self, zx, zy):
+        """观测 `(zx, zy)` 相对当前预测的马氏距离平方。"""
+        y = np.array([zx, zy]) - self.H @ self.x
+        S = self.H @ self.P @ self.H.T + self.R
+        return float(y @ np.linalg.solve(S, y))
+
     def update(self, zx, zy, area):
-        H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], float)
+        H = self.H
         y = np.array([zx, zy]) - H @ self.x
         S = H @ self.P @ H.T + self.R
         K = self.P @ H.T @ np.linalg.inv(S)
@@ -112,7 +144,10 @@ class Tracker:
     ```
     """
 
-    def __init__(self, roi, clock=None, stitch=True, min_conf=0.0, n_hint=1):
+    def __init__(self, roi, clock=None, stitch=True, min_conf=0.0, n_hint=1, gate="uncertainty"):
+        if gate not in GATES:
+            raise ValueError(f"gate 只能是 {GATES}，收到 {gate!r}")
+        self.gate = gate
         self.clk = clock or timing.Clock(n_hint, roi_w=roi[2])
         self.stitch = stitch
         self.min_conf = min_conf
@@ -137,7 +172,7 @@ class Tracker:
         return float(min(d[3], d[4], self.rw - d[5], self.rh - d[6]))
 
     def _born(self, tid, d, k):
-        t = Track(tid, d[0], d[1], d[2])
+        t = Track(tid, d[0], d[1], d[2], dt_aware=self.gate == "uncertainty")
         t.last_k = k
         t.edge = self.edge_of(d)
         return t
@@ -149,11 +184,13 @@ class Tracker:
         last_shift, morgue = self.last_shift, self.morgue
         dets = [d for d in dets_all if d[7] >= self.min_conf]
         for t in tracks:
-            t.predict()
+            t.predict(clk.dt(k))
 
         pairs, shifts = {}, []
         if tracks and dets:
+            # 物理上限：两种模式都有。uncertainty 模式下真正起作用的是马氏距离闸
             gate = clk.speed_raw(timing.GATE_PPS, k)
+            by_uncertainty = self.gate == "uncertainty"
             cost = np.full((len(tracks), len(dets)), 1e4)
             for i, t in enumerate(tracks):
                 # ⛔ 不拿「上次观测 + 背景已滚过的距离」当预测位置：那个先验对
@@ -162,7 +199,9 @@ class Tracker:
                 tx, ty = t.pos
                 for j, d in enumerate(dets):
                     dist = float(np.hypot(tx - d[0], ty - d[1]))
-                    if dist < gate:
+                    if dist < gate and (
+                        not by_uncertainty or t.mahal2(d[0], d[1]) <= timing.GATE_CHI2
+                    ):
                         ar = abs(np.log(max(d[2], 1) / max(t.area, 1)))
                         cost[i, j] = dist + 40.0 * ar
             pairs = {i: j for i, j in hungarian(cost).items() if cost[i, j] < 1e4}
@@ -253,15 +292,15 @@ class Tracker:
         return row
 
 
-def track(obs, roi, clock=None, stitch=True, min_conf=0.0):
+def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty"):
     """离线口径：把 [`Tracker`] 跑一遍。**这里不许有第二份逻辑。**
 
     `obs[k]` 是第 k 帧的检测列表（见 [`Detection`]）。返回逐帧
     `(帧号, {tid: (x, y, vx, vy, hits, missed, edge)}, 累计背景位移)`，
-    其中 `(x, y)` 在**背景系**。
+    其中 `(x, y)` 在**背景系**；`(vx, vy)` 的单位随门控模式不同（px/秒 或 px/帧）。
     """
     clk = clock or timing.Clock(len(obs), roi_w=roi[2])
-    tk = Tracker(roi, clk, stitch=stitch, min_conf=min_conf)
+    tk = Tracker(roi, clk, stitch=stitch, min_conf=min_conf, gate=gate)
     for k, dets in enumerate(obs):
         tk.step(k, dets)
     return tk.history
