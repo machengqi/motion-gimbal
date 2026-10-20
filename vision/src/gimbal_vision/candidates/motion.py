@@ -69,20 +69,24 @@ class MotionCandidates:
         self.s = width / timing.REF_W
         self.prev = None
         self.prev_t = None
+        self.prev_mask = None
 
     def reset(self):
-        self.prev = self.prev_t = None
+        self.prev = self.prev_t = self.prev_mask = None
 
-    def __call__(self, gray: np.ndarray, t: float) -> FrameResult:
+    def __call__(self, gray: np.ndarray, t: float, mask: np.ndarray | None = None) -> FrameResult:
+        """`mask`（可选，uint8，非零 = 有效像素）：画面里只有一部分是真实像素时（例如取景窗伸出了
+        素材边界、其余补黑），角点只在上一帧的有效区取，跟到这一帧后落在无效区的点丢掉 ——
+        否则有效区的边界随相机移动，会被当成运动。"""
         p = self.p
-        prev, prev_t = self.prev, self.prev_t
-        self.prev, self.prev_t = gray, t
+        prev, prev_t, prev_mask = self.prev, self.prev_t, self.prev_mask
+        self.prev, self.prev_t, self.prev_mask = gray, t, mask
         if prev is None:
             return FrameResult([], np.zeros(2), np.eye(3), 0, 0)
         dt = max(t - prev_t, 1e-4)
 
         p0 = cv2.goodFeaturesToTrack(
-            prev, maxCorners=p.max_pts, qualityLevel=p.quality, minDistance=p.min_dist
+            prev, maxCorners=p.max_pts, qualityLevel=p.quality, minDistance=p.min_dist, mask=prev_mask
         )
         if p0 is None or len(p0) < 8:
             return FrameResult([], None, None, 0, 0)
@@ -91,6 +95,12 @@ class MotionCandidates:
         pb, st2, _ = cv2.calcOpticalFlowPyrLK(gray, prev, p1, None, **lk)
         fb = np.linalg.norm((p0 - pb).reshape(-1, 2), axis=1)
         ok = (st1.ravel() == 1) & (st2.ravel() == 1) & (fb < p.fb_err)
+        if mask is not None:
+            q = np.round(p1.reshape(-1, 2)).astype(int)
+            hh, ww = mask.shape[:2]
+            inside = (q[:, 0] >= 0) & (q[:, 0] < ww) & (q[:, 1] >= 0) & (q[:, 1] < hh)
+            ok &= inside
+            ok[inside] &= mask[q[inside, 1], q[inside, 0]] > 0
         a, b = p0.reshape(-1, 2)[ok], p1.reshape(-1, 2)[ok]
         if len(a) < 8:
             return FrameResult([], None, None, int(len(a)), 0)

@@ -38,6 +38,22 @@ STITCH_AREA = 0.8
 CUT_KEEP = 0.35
 """帧间配对率低于这个比例就判「镜头切换」，重置累计背景位移。"""
 
+MEAS_VAR = (15.2, 16.7)
+"""观测噪声 `R = diag(σx², σy²)`（px²，640 宽画面），按 `candidates.motion` 的实测框心抖动标定。
+
+标定（`vision/scripts/calib_r.py`，只用 MoCA dev 集，2026-10-20）：相邻两帧都**恰好有一个**候选与真值框
+匹配（E1 判据）时，取候选中心相对真值中心的残差 `e`，看它的帧间差 `Δe = e[k] − e[k−1]` ——
+真值扣掉了目标运动，差分扣掉了「点云落在身体哪一部分」的持续偏置，剩下的就是逐帧白噪声：
+
+```text
+σ_axis² = (1.4826 · MAD(Δe_axis))² / 2        （差分使方差加倍 ⇒ ÷2；MAD 抗住部位跳变的长尾）
+```
+
+实测 σ ≈ (3.9, 4.1) px。⚠️ 残差是重尾的（|Δe| 的 95% 分位 55px、99% 分位 151px，来自候选在身体部位
+之间跳变），这部分不是高斯噪声，R 不吸收它；见 docs/EXPERIMENTS.md 的 R 标定一节。
+⚠️ 换检测器、换分辨率都要重测。
+"""
+
 
 GATES = ("uncertainty", "speed")
 """关联门控的两种模式。
@@ -61,13 +77,15 @@ class Track:
 
     Q = np.diag([2.0, 2.0, 0.35, 0.35])
     """按帧模型的过程噪声（每帧）。"""
-    R = np.diag([9.0, 9.0])
-    """观测噪声（px²）。量级应与检测框心的抖动相符，换检测器后要重新实测。"""
+    R = np.diag(MEAS_VAR)
+    """观测噪声（px²），见 [`MEAS_VAR`]。实例上可被 `Tracker(meas_var=...)` 覆盖。"""
     H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], float)
 
-    def __init__(self, tid, x, y, area, dt_aware=True):
+    def __init__(self, tid, x, y, area, dt_aware=True, meas_var=None):
         self.id = tid
         self.dt_aware = dt_aware
+        if meas_var is not None:
+            self.R = np.diag(np.broadcast_to(np.asarray(meas_var, float), (2,)))
         self.x = np.array([x, y, 0.0, 0.0])
         vel_var = timing.INIT_VEL_VAR if dt_aware else 100.0
         self.P = np.diag([4.0, 4.0, vel_var, vel_var])
@@ -144,10 +162,14 @@ class Tracker:
     ```
     """
 
-    def __init__(self, roi, clock=None, stitch=True, min_conf=0.0, n_hint=1, gate="uncertainty"):
+    def __init__(
+        self, roi, clock=None, stitch=True, min_conf=0.0, n_hint=1, gate="uncertainty", meas_var=None
+    ):
         if gate not in GATES:
             raise ValueError(f"gate 只能是 {GATES}，收到 {gate!r}")
         self.gate = gate
+        self.meas_var = meas_var
+        """观测噪声（px²，标量或每轴两个值）；`None` = [`MEAS_VAR`]。只用于消融对照。"""
         self.clk = clock or timing.Clock(n_hint, roi_w=roi[2])
         self.stitch = stitch
         self.min_conf = min_conf
@@ -172,7 +194,7 @@ class Tracker:
         return float(min(d[3], d[4], self.rw - d[5], self.rh - d[6]))
 
     def _born(self, tid, d, k):
-        t = Track(tid, d[0], d[1], d[2], dt_aware=self.gate == "uncertainty")
+        t = Track(tid, d[0], d[1], d[2], dt_aware=self.gate == "uncertainty", meas_var=self.meas_var)
         t.last_k = k
         t.edge = self.edge_of(d)
         return t
@@ -301,7 +323,7 @@ class Tracker:
         return row
 
 
-def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty", shifts=None):
+def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty", shifts=None, meas_var=None):
     """离线口径：把 [`Tracker`] 跑一遍。**这里不许有第二份逻辑。**
 
     `obs[k]` 是第 k 帧的检测列表（见 [`Detection`]）。返回逐帧
@@ -310,7 +332,7 @@ def track(obs, roi, clock=None, stitch=True, min_conf=0.0, gate="uncertainty", s
     其中 `(x, y)` 在**背景系**；`(vx, vy)` 的单位随门控模式不同（px/秒 或 px/帧）。
     """
     clk = clock or timing.Clock(len(obs), roi_w=roi[2])
-    tk = Tracker(roi, clk, stitch=stitch, min_conf=min_conf, gate=gate)
+    tk = Tracker(roi, clk, stitch=stitch, min_conf=min_conf, gate=gate, meas_var=meas_var)
     for k, dets in enumerate(obs):
         tk.step(k, dets, None if shifts is None else shifts[k])
     return tk.history

@@ -21,6 +21,15 @@
 来回摆动的东西（风吹的草叶、晃动的枝条）路程大、净位移小；
 持续移动的目标净位移大。判据用净位移，摆动类干扰天然被压低。
 
+# 两条可选规则（默认值见 `Selector`，依据见 docs/EXPERIMENTS.md 的 E2 修复消融）
+
+- **画面坐标排除**（`screenfix`）：台标、水印、黑边钉在**画面**上，背景系里却随相机一起「运动」，
+  净位移大 ⇒ 会被当成最显著的目标。判据是排除名单在画面系的镜像：时间窗 `STATIC_SEC` 内画面系
+  散布 < `STATIC_R`、而背景系净位移 > 2·`STATIC_R` 的轨迹，这一帧不参与选择。逐帧判、不入名单 ——
+  目标被跟拍得纹丝不动时也满足这个签名，一旦它在画面里动起来就立即恢复资格。
+- **过期撤回**（`stale`）：估计位置连续 `timing.STALE_SEC` 没有新证据就撤回成「无估计」，下一个
+  候选直接接管，不再走远跳印证。防止首锁锁错之后，回跳印证一直凑不齐而永远停在错处。
+
 # 锁定一条轨迹一路跟下去是不行的
 
 轨迹可能从目标身上平滑地漂到相邻物体上，而全程 `missed == 0`、不报错。
@@ -92,12 +101,34 @@ def spread(seq, k, tid, lo, need):
     return float(np.max(np.hypot(*(a - a.mean(0)).T)))
 
 
-class Selector:
-    """**逐帧喂跟踪结果，逐帧出「目标在哪」。** 状态全在这里，可在线使用。"""
+def screen_fixed(seq, hist, origin, k, tid, lo, need, r):
+    """`tid` 在时间窗 `[lo, k]` 内是否「钉在画面上」：画面系散布 < `r` 且背景系净位移 > `2r`。
 
-    def __init__(self, clock, roi):
+    画面系 = 背景系 + 当帧累计背景位移 + 当帧画面原点（`origin[帧号]`；裁剪取景窗时是取景窗在全幅里的
+    左上角，让「画面」始终指原始素材的像素坐标）。观测不够返回 `False`。
+    """
+    pts = [p for p in seq.get(tid, []) if lo <= p[0] <= k]
+    if len(pts) < need * 0.8 or pts[-1][0] < k - 1:
+        return False
+    b = np.array([[x, y] for _, x, y in pts])
+    f = b + np.array([hist[kk][2] + origin.get(kk, 0.0) for kk, _, _ in pts])
+    sp = float(np.max(np.hypot(*(f - f.mean(0)).T)))
+    return sp < r and float(np.hypot(*(b[-1] - b[0]))) > 2 * r
+
+
+class Selector:
+    """**逐帧喂跟踪结果，逐帧出「目标在哪」。** 状态全在这里，可在线使用。
+
+    `screenfix` / `stale` 见模块文档；`shift_chal=False` 复现修复前的行为（印证中的远跳位置只在
+    下一次远跳时才随背景平移），只用于消融对照。
+    """
+
+    def __init__(self, clock, roi, screenfix=True, stale=True, shift_chal=True):
         self.clk = clock
         self.roi = roi
+        self.screenfix = screenfix
+        self.stale = stale
+        self.shift_chal = shift_chal
         # 这两个只与画面缩放有关，而一段序列内画面尺寸不变 ⇒ 可以算死
         self.static_r = STATIC_R * clock.s
         self.excluded = ExclusionMap(BAN_R * clock.s)
@@ -105,22 +136,37 @@ class Selector:
         self.cur = None
         self.chal = None
         self.streak = 0
+        self.last_fresh = None
+        self.origin: dict[int, np.ndarray] = {}
 
     # ⛔ 必须是 property：在线时钟随帧更新，算死会停在第一帧的估计上。
     @property
     def n_confirm(self):
         return max(2, self.clk.frames_in(timing.CONFIRM_SEC))
 
-    def step(self, k, hist, seq, bg):
+    def step(self, k, hist, seq, bg, origin=None):
         """走一帧。返回 `(阶段, 画面系位置或None, tid或None, 是否新证据)`。
 
+        `origin`：这一帧画面左上角在原始素材里的坐标（只给 `screenfix` 用），默认 `(0, 0)`。
         阶段：`"wait"` 等待 / `"track"` 跟踪 / `"jump"` 印证后跳到新位置。
         """
         clk = self.clk
         cum = hist[k][2]
+        self.origin[k] = np.zeros(2) if origin is None else np.asarray(origin, float)
         # 不确定时估计值跟着背景滑动，不外推自身速度
         if self.pos is not None:
             self.pos = self.pos + bg
+        # ⛔ 印证中的远跳位置与 pos 同在画面系，必须每帧一起平移；只在远跳分支里平移的话，
+        #    中间隔着没有候选的帧时它会停在旧画面坐标上，与新观测比较时差出这几帧的背景位移。
+        if self.shift_chal and self.chal is not None:
+            self.chal = self.chal + bg
+        if (
+            self.stale
+            and self.pos is not None
+            and self.last_fresh is not None
+            and clk.t[k] - clk.t[self.last_fresh] > timing.STALE_SEC
+        ):
+            self.pos, self.cur, self.chal, self.streak = None, None, None, 0
 
         # ① 排除名单：近 STATIC_SEC 秒几乎没动过的位置，标为干扰点
         lo_s, n_s = clk.window(k, timing.STATIC_SEC)
@@ -136,6 +182,8 @@ class Selector:
         cand = {}
         for tid, v in hist[k][1].items():
             if v[5] != 0 or self.excluded.hit(v[0], v[1]):
+                continue
+            if self.screenfix and screen_fixed(seq, hist, self.origin, k, tid, lo_s, n_s, self.static_r):
                 continue
             d = net_disp(seq, k, tid, lo_b, n_b)
             if d is not None:
@@ -160,7 +208,8 @@ class Selector:
             else:
                 # 远跳要连续印证；印证按**位置**比，不按 tid（tid 会频繁切换）
                 if self.chal is not None:
-                    self.chal = self.chal + bg
+                    if not self.shift_chal:
+                        self.chal = self.chal + bg
                     near = float(np.hypot(*(p - self.chal))) <= clk.speed(timing.CONFIRM_R_PPS, k)
                     self.streak = self.streak + 1 if near else 1
                 else:
@@ -169,4 +218,6 @@ class Selector:
                 if self.streak >= self.n_confirm:
                     self.pos, self.cur, self.chal, self.streak = p, pick, None, 0
                     phase, fresh = "jump", True
+        if fresh:
+            self.last_fresh = k
         return phase, (None if self.pos is None else tuple(self.pos)), self.cur, fresh
