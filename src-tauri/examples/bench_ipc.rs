@@ -154,11 +154,17 @@ fn chain(svc: &VisionService, path: &str, proc_width: u32, paced: bool, probe_rt
     let (mut lat, mut proc_ms, mut read_ms, mut cand, mut core_ms, mut prep) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     let (mut wcopy, mut wwait) = (vec![], vec![]);
     let mut arrivals: Vec<Instant> = Vec::new();
+    // 节拍滞后：这一帧实际写进帧环的时刻比它的时间戳晚了多少（相对第一帧对齐）
+    let mut lag = Vec::new();
+    let mut first: Option<(Instant, f64)> = None;
     let (mut frames, mut aims, mut skipped) = (0u64, 0u64, 0u64);
     let t0 = Instant::now();
     let reason = session::run(&info, &gimbal, &stop, &auto, &opts, Some(svc), &mut |tk| {
         if tk.index != TAIL {
             frames += 1;
+            let now = Instant::now();
+            let (i0, t0v) = *first.get_or_insert((now, tk.t));
+            lag.push(ms(now - i0) - (tk.t - t0v) * 1e3);
         }
         if let Some(w) = tk.write {
             wcopy.push(ms(w.copy));
@@ -184,6 +190,9 @@ fn chain(svc: &VisionService, path: &str, proc_width: u32, paced: bool, probe_rt
     })
     .unwrap();
     let wall = t0.elapsed().as_secs_f64();
+    // 第一帧本身晚到（ffmpeg 起进程、会话建立），以「最早的一帧」为零点：之后每帧比节拍晚多少
+    let lag0 = lag.iter().copied().fold(f64::INFINITY, f64::min);
+    let lag: Vec<f64> = lag.iter().map(|x| x - lag0).collect();
     rtt_stop.store(true, Ordering::Relaxed);
     let rtt_v = rtt_h.map(|h| h.join().unwrap());
     let duration = frames as f64 / info.fps;
@@ -211,8 +220,12 @@ fn chain(svc: &VisionService, path: &str, proc_width: u32, paced: bool, probe_rt
         "service_core_ms": pct(&core_ms),
         "ring_write_copy_ms": pct(&wcopy),
         "ring_write_wait_ms": pct(&wwait),
+        "pacing_lag_ms": pct(&lag),
         "control_rtt_under_load_ms": rtt_v.map(|v| pct(&v)).unwrap_or(Value::Null),
-        "keeps_15hz": paced.then(|| lat.len() as u64 == frames && duration / wall > 0.98 && p50(&proc_ms) < interval_ms),
+        "keeps_15hz": paced.then(|| {
+            let lag_p99 = pct(&lag)["p99"].as_f64().unwrap_or(f64::INFINITY);
+            lat.len() as u64 == frames && lag_p99 < interval_ms && p50(&proc_ms) < interval_ms
+        }),
         "cpu_load_percent": cpu.finish(),
     });
     eprintln!(
@@ -277,7 +290,7 @@ fn main() {
             "ring_micro": "同进程 Rust 写者 + Rust 读者，Block 模式 4 槽；写 = seq 置奇→拷像素→seq 置偶→发布；读 = 序列锁校验 + 拷出到 Vec；各 300 次",
             "control_rtt": "ureq 阻塞客户端对 FastAPI/uvicorn 的 GET 往返（127.0.0.1，长连接）",
             "latency": "宿主写帧环完成的时刻 → 结果线程收到该帧结果并完成 VirtualGimbal::aim_in 的时刻（同一进程 Instant）",
-            "paced": "按视频时间戳（15 fps）节拍写帧；keeps_15hz = 结果数==帧数 且 实时比>0.98 且 服务处理中位数<帧间隔",
+            "paced": "按视频时间戳（15 fps）节拍写帧；pacing_lag_ms = 每帧实际写入时刻相对其时间戳的滞后（以最不滞后的一帧为零点）；keeps_15hz = 结果数==帧数 且 滞后 p99 < 一个帧间隔（66.7 ms）且 服务处理中位数 < 帧间隔；realtime_factor = 视频时长 / 墙钟（墙钟含会话建立与收尾）",
             "unpaced": "不等节拍、尽快写（Block 模式环满等待），throughput_fps 为整条链（解码+写环+处理+回传）的吞吐",
             "proc_width": "640 = 帧先缩放到 640 宽等效再处理（算法标定口径）；native = 原分辨率处理",
             "perception": "window（闭环：只看取景窗，取景窗 = 全幅的 1/2 × 1/2）",
