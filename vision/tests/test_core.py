@@ -145,7 +145,7 @@ def test_the_gain_is_a_ratio_not_a_rate():
 
 def test_frame_rate_guard_tolerates_float_error_at_the_boundary():
     """24 Hz 素材隔帧取出的 12 Hz 恰在下限上，不能因浮点误差（1/(2/24) = 11.999…）判为过低。"""
-    ts = np.arange(60) * (2 / 24)
+    ts = np.arange(0, 120, 2) / 24  # 与降采样实验相同：保留帧的时间戳 = 原始帧号 / 24
     clk = timing.Clock(len(ts), ts)
     assert clk.hz() < timing.HZ_MIN  # 浮点误差确实存在
     assert clk.ok()[0]

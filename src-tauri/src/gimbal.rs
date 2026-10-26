@@ -55,7 +55,16 @@ impl VirtualGimbal {
     /// 平滑性由上游控制器（Python `core.controller`）负责，这里只做几何与边界。
     pub fn aim(&mut self, x_in_window: f64, y_in_window: f64) {
         let r = self.rect();
-        self.set_center(r.x as f64 + x_in_window, r.y as f64 + y_in_window);
+        self.aim_in(r.x as f64, r.y as f64, x_in_window, y_in_window);
+    }
+
+    /// **对准某一帧取景窗里的一点**：`(ox, oy)` 是**那一帧**取景窗的左上角（全幅坐标）。
+    ///
+    /// 视觉服务的结果总是晚于帧到达：算出结果时云台可能已经动过（上一条结果、或手动操作）。
+    /// 按结果所对应那一帧的取景窗换算，而不是按当前取景窗 —— 否则延迟期间的移动会被重复叠加。
+    /// 与 [`aim`](Self::aim) 的关系：`aim(x, y) == aim_in(当前左上角, x, y)`。
+    pub fn aim_in(&mut self, ox: f64, oy: f64, x: f64, y: f64) {
+        self.set_center(ox + x, oy + y);
     }
 
     /// 取景窗在全幅里的整数像素矩形。
@@ -72,15 +81,19 @@ impl VirtualGimbal {
 
     /// 从 RGB24 全幅帧裁出取景窗。
     pub fn crop_rgb(&self, frame: &[u8]) -> Vec<u8> {
-        let r = self.rect();
-        let stride = self.full.0 as usize * 3;
-        let mut out = Vec::with_capacity((r.w * r.h * 3) as usize);
-        for row in r.y..r.y + r.h {
-            let start = row as usize * stride + r.x as usize * 3;
-            out.extend_from_slice(&frame[start..start + r.w as usize * 3]);
-        }
-        out
+        crop_rgb(frame, self.full.0, self.rect())
     }
+}
+
+/// 从宽为 `full_w` 的 RGB24 帧裁出矩形 `r`。
+pub fn crop_rgb(frame: &[u8], full_w: u32, r: Rect) -> Vec<u8> {
+    let stride = full_w as usize * 3;
+    let mut out = Vec::with_capacity((r.w * r.h * 3) as usize);
+    for row in r.y..r.y + r.h {
+        let start = row as usize * stride + r.x as usize * 3;
+        out.extend_from_slice(&frame[start..start + r.w as usize * 3]);
+    }
+    out
 }
 
 /// 最近邻缩放 RGB24（预览用，不进算法）。
