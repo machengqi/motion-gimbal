@@ -30,6 +30,15 @@
 - **过期撤回**（`stale`）：估计位置连续 `timing.STALE_SEC` 没有新证据就撤回成「无估计」，下一个
   候选直接接管，不再走远跳印证。防止首锁锁错之后，回跳印证一直凑不齐而永远停在错处。
 
+# 可选：排除图用单应传播（`warps`）
+
+默认的背景系是**平移**模型（画面坐标 − 累计背景位移）：相机旋转、变焦、景深视差时，离画面中心越远的
+静止物体在背景系里越会「漂」。给 `Selector(warps=...)`（逐帧单应 `H[k]`：第 k−1 帧 → 第 k 帧，例如
+`candidates.motion` 的 `homography`）时，排除图改为存在**当帧画面坐标**里、每帧用 `H[k]` 传播，
+「静止」散布也在当帧画面系里算（窗口内的历史位置用窗口内的单应链换到当帧）。`warp_disp=True` 时净位移
+判据同样用单应链。平移矩阵当 `warps` 时与默认行为一致（测试 `test_translation_warps_reproduce_the_default`）。
+只用于背景模型的对照实验（docs/EXPERIMENTS.md）。
+
 # 锁定一条轨迹一路跟下去是不行的
 
 轨迹可能从目标身上平滑地漂到相邻物体上，而全程 `missed == 0`、不报错。
@@ -73,14 +82,25 @@ class ExclusionMap:
         return any((p[0] - x) ** 2 + (p[1] - y) ** 2 <= r2 for p in self.pts)
 
     def mark(self, x, y):
+        """标记一个干扰点。返回 `True` = 新建了一个点，`False` = 并入已有点。"""
         r2 = self.r * self.r
         for p in self.pts:
             if (p[0] - x) ** 2 + (p[1] - y) ** 2 <= r2:
                 p[0] += DRIFT * (x - p[0])
                 p[1] += DRIFT * (y - p[1])
                 p[2] += 1
-                return
+                return False
         self.pts.append([x, y, 1])
+        return True
+
+    def warp(self, H):
+        """把所有点按 3×3 矩阵 `H` 搬到下一帧的画面坐标（只在 `Selector(warps=...)` 时用）。"""
+        if not self.pts:
+            return
+        a = np.array([[p[0], p[1], 1.0] for p in self.pts]) @ np.asarray(H, float).T
+        a = a[:, :2] / a[:, 2:3]
+        for p, q in zip(self.pts, a, strict=True):
+            p[0], p[1] = float(q[0]), float(q[1])
 
 
 def net_disp(seq, k, tid, lo, need):
@@ -123,8 +143,15 @@ class Selector:
     下一次远跳时才随背景平移），只用于消融对照。
     """
 
-    def __init__(self, clock, roi, screenfix=True, stale=True, shift_chal=True):
+    def __init__(self, clock, roi, screenfix=True, stale=True, shift_chal=True, warps=None, warp_disp=False):
         self.clk = clock
+        self.warps = warps
+        """逐帧单应（第 k−1 帧 → 第 k 帧，`None` 当单位阵）；给了就用单应传播排除图，见模块文档。"""
+        self.warp_disp = warp_disp and warps is not None
+        self._chain: dict[int, np.ndarray] = {}  # τ → 第 τ 帧画面 → 第 k 帧画面 的单应链
+        self.stats = {"mark_new": 0, "mark_merge": 0, "excluded": 0, "gate_checked": 0, "gate_fired": 0}
+        self.last_excluded: list = []
+        """这一帧被排除图拿掉的 tid（诊断用）。"""
         self.roi = roi
         self.screenfix = screenfix
         self.stale = stale
@@ -143,6 +170,30 @@ class Selector:
     @property
     def n_confirm(self):
         return max(2, self.clk.frames_in(timing.CONFIRM_SEC))
+
+    def _warped(self, seq, hist, k, tid, lo):
+        """`tid` 在 `[lo, k]` 内的观测，换到第 k 帧画面坐标（单应链）。返回 `(帧号列表, N×2 数组)`。"""
+        pts = [p for p in seq.get(tid, []) if lo <= p[0] <= k]
+        if not pts:
+            return [], np.zeros((0, 2))
+        a = np.empty((len(pts), 2))
+        for i, (kk, x, y) in enumerate(pts):
+            c = hist[kk][2]
+            q = self._chain[kk] @ np.array([x + c[0], y + c[1], 1.0])
+            a[i] = q[:2] / q[2]
+        return [p[0] for p in pts], a
+
+    def _spread_w(self, seq, hist, k, tid, lo, need):
+        ks, a = self._warped(seq, hist, k, tid, lo)
+        if len(ks) < need * 0.8 or ks[-1] < k - 1:
+            return None
+        return float(np.max(np.hypot(*(a - a.mean(0)).T)))
+
+    def _net_disp_w(self, seq, hist, k, tid, lo, need):
+        ks, a = self._warped(seq, hist, k, tid, lo)
+        if not ks or ks[-1] < k - 1 or len(ks) < need * 0.6 or ks[0] > lo + 2:
+            return None
+        return float(np.hypot(*(a[-1] - a[0])))
 
     def step(self, k, hist, seq, bg, origin=None):
         """走一帧。返回 `(阶段, 画面系位置或None, tid或None, 是否新证据)`。
@@ -171,28 +222,56 @@ class Selector:
         # ① 排除名单：近 STATIC_SEC 秒几乎没动过的位置，标为干扰点
         lo_s, n_s = clk.window(k, timing.STATIC_SEC)
         lo_b, n_b = clk.window(k, timing.WINDOW_SEC)
+        warped = self.warps is not None
+        if warped:
+            # 排除图与窗口内的历史都换到这一帧的画面坐标（单应传播）
+            Hk = self.warps[k] if k > 0 and self.warps[k] is not None else np.eye(3)
+            Hk = np.asarray(Hk, float)
+            lo = min(lo_s, lo_b)
+            self._chain = {kk: Hk @ M for kk, M in self._chain.items() if kk >= lo}
+            self._chain[k] = np.eye(3)
+            if k > 0:
+                self.excluded.warp(Hk)
+
+        def loc(v):  # 排除图里比较用的坐标：默认背景系；单应模式下当帧画面系
+            return (v[0] + cum[0], v[1] + cum[1]) if warped else (v[0], v[1])
+
         for tid, v in hist[k][1].items():
             if v[5] != 0:
                 continue
-            sp = spread(seq, k, tid, lo_s, n_s)
+            if warped:
+                sp = self._spread_w(seq, hist, k, tid, lo_s, n_s)
+            else:
+                sp = spread(seq, k, tid, lo_s, n_s)
             if sp is not None and sp < self.static_r:
-                self.excluded.mark(v[0], v[1])
+                new = self.excluded.mark(*loc(v))
+                self.stats["mark_new" if new else "mark_merge"] += 1
 
         # ② 排除法 + 显著性
         cand = {}
+        self.last_excluded = []
         for tid, v in hist[k][1].items():
-            if v[5] != 0 or self.excluded.hit(v[0], v[1]):
+            if v[5] != 0:
+                continue
+            if self.excluded.hit(*loc(v)):
+                self.last_excluded.append(tid)
+                self.stats["excluded"] += 1
                 continue
             if self.screenfix and screen_fixed(seq, hist, self.origin, k, tid, lo_s, n_s, self.static_r):
                 continue
-            d = net_disp(seq, k, tid, lo_b, n_b)
+            if self.warp_disp:
+                d = self._net_disp_w(seq, hist, k, tid, lo_b, n_b)
+            else:
+                d = net_disp(seq, k, tid, lo_b, n_b)
             if d is not None:
                 cand[tid] = d
 
         # ③ 置信闸
         if len(cand) >= 3:
+            self.stats["gate_checked"] += 1
             med = float(np.median(list(cand.values())))
             if max(cand.values()) < LEAD * max(med, 1e-6):
+                self.stats["gate_fired"] += 1
                 cand = {}
 
         phase, fresh = "wait", False
