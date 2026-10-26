@@ -41,22 +41,50 @@ class Registrar:
     def features(self, gray):
         return self.sift.detectAndCompute(gray, None)
 
+    def matches(self, fa, fb):
+        """两帧特征 → 比值检验后的对应点 `(pa, pb, 匹配数)`；点不够时 `pa = pb = None`。"""
+        (ka, da), (kb, db) = fa, fb
+        if da is None or db is None or len(ka) < MIN_INLIERS or len(kb) < MIN_INLIERS:
+            return None, None, 0
+        good = [m for m, n in (p for p in self.bf.knnMatch(da, db, k=2) if len(p) == 2) if m.distance < RATIO * n.distance]
+        if len(good) < MIN_INLIERS:
+            return None, None, len(good)
+        pa = np.float32([ka[m.queryIdx].pt for m in good])
+        pb = np.float32([kb[m.trainIdx].pt for m in good])
+        return pa, pb, len(good)
+
+    def homography(self, fa, fb):
+        """两帧特征 → `(单应 H（a → b）, 内点数)`；失败返回 `(None, 内点数)`。"""
+        pa, pb, n = self.matches(fa, fb)
+        if pa is None:
+            return None, n
+        H, inl = cv2.findHomography(pa, pb, cv2.RANSAC, RANSAC_PX)
+        n_in = int(inl.sum()) if inl is not None else 0
+        if H is None or n_in < MIN_INLIERS:
+            return None, n_in
+        return H, n_in
+
+    def similarity(self, fa, fb):
+        """两帧特征 → `(相似变换（4 自由度，3×3 形式，a → b）, 内点数)`；失败返回 `(None, 内点数)`。
+
+        只用于背景模型的对照（`scripts/diag_drift.py`），画布本身仍取单应把画面中心映到哪。
+        """
+        pa, pb, n = self.matches(fa, fb)
+        if pa is None:
+            return None, n
+        A, inl = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=RANSAC_PX)
+        n_in = int(inl.sum()) if inl is not None else 0
+        if A is None or n_in < MIN_INLIERS:
+            return None, n_in
+        return np.vstack([A, [0.0, 0.0, 1.0]]), n_in
+
     def shift(self, fa, fb, size):
         """两帧特征 → `(画面中心的平移 (dx, dy), 内点数)`；失败返回 `(None, 内点数)`。
 
         平移的含义：a 帧里画面中心处的静止背景点，在 b 帧里移到了 `中心 + (dx, dy)`。
         """
-        (ka, da), (kb, db) = fa, fb
-        if da is None or db is None or len(ka) < MIN_INLIERS or len(kb) < MIN_INLIERS:
-            return None, 0
-        good = [m for m, n in (p for p in self.bf.knnMatch(da, db, k=2) if len(p) == 2) if m.distance < RATIO * n.distance]
-        if len(good) < MIN_INLIERS:
-            return None, len(good)
-        pa = np.float32([ka[m.queryIdx].pt for m in good])
-        pb = np.float32([kb[m.trainIdx].pt for m in good])
-        H, inl = cv2.findHomography(pa, pb, cv2.RANSAC, RANSAC_PX)
-        n_in = int(inl.sum()) if inl is not None else 0
-        if H is None or n_in < MIN_INLIERS:
+        H, n_in = self.homography(fa, fb)
+        if H is None:
             return None, n_in
         w, h = size
         c = np.array([[[w / 2, h / 2]]], dtype=np.float64)
@@ -74,6 +102,25 @@ def accumulate(shifts):
         t = shifts[k]
         o[k] = o[k - 1] - (np.zeros(2) if t is None else np.asarray(t, float))
     return o
+
+
+def transforms(imgs):
+    """一段灰度帧 → 逐帧 `(单应列表, 相似变换列表, 内点数)`（第 k 个：第 k−1 帧 → 第 k 帧；第 0 个与失败帧为 `None`）。
+
+    与 [`offsets`] 用同一套特征与匹配；`offsets` 的平移 = 单应把画面中心映到哪。
+    """
+    reg = Registrar()
+    prev = reg.features(imgs[0])
+    Hs, Ss, inl = [None], [None], [0]
+    for k in range(1, len(imgs)):
+        cur = reg.features(imgs[k])  # 逐帧滚动，不同时持有整段的描述子（长视频会占上 GB 内存）
+        H, n = reg.homography(prev, cur)
+        S, _ = reg.similarity(prev, cur)
+        prev = cur
+        Hs.append(H)
+        Ss.append(S)
+        inl.append(n)
+    return Hs, Ss, np.array(inl)
 
 
 def offsets(imgs):
