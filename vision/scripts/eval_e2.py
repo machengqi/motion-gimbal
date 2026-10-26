@@ -228,17 +228,25 @@ def canvas_offsets(name, width, imgs):
     return d
 
 
-def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: list[str]) -> dict:
+def prepare(name: str, width: int, keep=None, stab=True) -> dict:
+    """读一段、跑全幅候选（开环共用，与协议、取景窗无关）。
+
+    `keep`（可选）：在**去复制帧后**的帧序列里保留哪些下标（升序）—— 帧率 / 抖动实验用
+    （`scripts/eval_fps.py`）。时间戳仍是保留帧的真实时间戳；E2b 画布偏移在完整序列上算好
+    （与被测方法无关的「尺子」不随帧率变），再取保留帧的那几行。`keep=None` 与原 E2 / E2b 逐位相同。
+    """
     seq, dup, imgs, ks, s = load_sequence(name, width)
+    st = canvas_offsets(name, width, imgs) if stab else None
+    if keep is not None:
+        keep = np.asarray(keep, int)
+        imgs, ks = [imgs[i] for i in keep], [ks[i] for i in keep]
+        if st is not None:
+            inl = st["inliers"][keep]
+            st = {"o": st["o"][keep], "inliers": inl, "fail": int((inl[1:] < stabilize.MIN_INLIERS).sum())}
     n = len(imgs)
     H, W = imgs[0].shape[:2]
     ts = np.array(ks, dtype=float) / moca.FPS
     clk = timing.Clock(n, ts, roi_w=W)
-    if protocol == "e2b":
-        stab = canvas_offsets(name, width, imgs)
-        offs = stab["o"]
-    else:
-        stab, offs = None, np.zeros((n, 2))
 
     gts, motions = [], []
     for k in ks:
@@ -246,7 +254,6 @@ def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: li
         gts.append(None if b is None else b * s)
         motions.append(seq.motion(k))
 
-    # ── 全幅候选（开环共用；与协议无关）──
     gen = MotionCandidates(width)
     obs, shifts, bg_fail = [], [], 0
     for i, img in enumerate(imgs):
@@ -257,6 +264,30 @@ def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: li
             shifts.append(np.zeros(2))
         else:
             shifts.append(np.asarray(r.bg_shift, float))
+    return dict(
+        name=name, width=width, seq=seq, dup=dup, imgs=imgs, ks=ks, ts=ts, clk=clk, W=W, H=H, stab=st,
+        gts=gts, motions=motions, obs=obs, shifts=shifts, bg_fail=bg_fail,
+    )
+
+
+def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: list[str]) -> dict:
+    return evaluate(prepare(name, width, stab=protocol == "e2b"), frac, protocol, methods)
+
+
+def evaluate(ctx: dict, frac: float, protocol: str, methods: list[str], aux: dict | None = None) -> dict:
+    """在 [`prepare`] 的结果上按一种协议、一个取景窗大小评测各方法。
+
+    `aux`（可选 dict）：开环 `core:*` 方法的逐帧输出 `(阶段, 瞄准点, tid)` 写进 `aux[方法]`，供诊断用。
+    """
+    seq, dup, imgs, ks, ts, clk = ctx["seq"], ctx["dup"], ctx["imgs"], ctx["ks"], ctx["ts"], ctx["clk"]
+    width, W, H = ctx["width"], ctx["W"], ctx["H"]
+    gts, motions, obs, shifts, bg_fail = ctx["gts"], ctx["motions"], ctx["obs"], ctx["shifts"], ctx["bg_fail"]
+    n = len(imgs)
+    if protocol == "e2b":
+        stab = ctx["stab"]
+        offs = stab["o"]
+    else:
+        stab, offs = None, np.zeros((n, 2))
 
     rects: dict[str, list] = {}
     clamps: dict[str, int] = {}
@@ -283,6 +314,8 @@ def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: li
                 obs, (0, 0, W, H), clock=clk, gate=v["gate"], shifts=shifts, meas_var=v["meas_var"], selector_kw=v["sel"]
             )
             rects[m], clamps[m] = follow([r[1] for r in out])
+            if aux is not None:
+                aux[m] = out
         elif kind in ("closed", "closed_naive"):
             win = Window(W, H, frac, protocol)
             g = MotionCandidates(width)  # 像素密度与全幅相同 ⇒ 阈值缩放沿用全幅宽度
@@ -358,7 +391,7 @@ def eval_sequence(name: str, width: int, frac: float, protocol: str, methods: li
             "canvas_excursion": float(np.max(np.hypot(*(offs - offs[0]).T)) / W),
         }
     return {
-        "name": name,
+        "name": ctx["name"],
         "frames": len(seq.frames),
         "duplicates": int(dup.sum()),
         "size": [W, H],
