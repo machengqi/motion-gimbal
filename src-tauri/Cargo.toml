@@ -21,3 +21,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 base64 = "0.22"
 jpeg-encoder = "0.6"
 anyhow = "1"
+ureq = { version = "2", default-features = false, features = ["json"] }
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory", "Win32_Foundation", "Win32_Security"] }
+
+[target."cfg(unix)".dependencies]
+memmap2 = "0.9.12"

@@ -41,3 +41,19 @@ fn downscaling_keeps_the_aspect_ratio() {
     assert_eq!((w, h), (640, 360));
     assert_eq!(out.len(), 640 * 360 * 3);
 }
+
+#[test]
+fn aiming_in_a_past_window_uses_that_windows_origin() {
+    // 结果晚到：算结果时的取景窗左上角是 (320, 180)，之后云台已被移走
+    let mut g = VirtualGimbal::new((1280, 720), (640, 360));
+    g.set_center(900.0, 500.0);
+    g.aim_in(320.0, 180.0, 420.0, 230.0);
+    assert_eq!(g.center(), (740.0, 410.0));
+    // aim 就是「按当前取景窗」的 aim_in
+    let mut a = VirtualGimbal::new((1280, 720), (640, 360));
+    let mut b = a.clone();
+    a.aim(100.0, 50.0);
+    let r = b.rect();
+    b.aim_in(r.x as f64, r.y as f64, 100.0, 50.0);
+    assert_eq!(a.center(), b.center());
+}

@@ -212,3 +212,52 @@ class Clock:
         if self.jitter() > 1.6:
             return True, f"帧间隔抖动 {self.jitter():.2f}（1.0=均匀），精度会下降"
         return True, f"帧率 {hz:.1f}Hz、抖动 {self.jitter():.2f}"
+
+
+class OnlineClock(Clock):
+    """**在线时钟** —— 帧一边到达一边 `push(t)`，时间轴随之增长。
+
+    与 [`Clock`] 的区别只在「中位帧间隔」怎么来：离线版用整段的中位数（看到了未来），这里用
+    **到当前帧为止**最近 `window` 个间隔的中位数（因果）。帧间隔均匀时两者在第 1 帧之后逐位相同，
+    这是 `core.Pipeline` 与离线 `core.run` 结果一致的前提（见 tests/test_service.py）。
+
+    ⚠️ 第 0 帧还没有间隔，中位间隔先用 `1 / fps_hint` 占位；第 0 帧上没有任何量用到它
+    （新轨迹不预测、瞄准点首帧直接取估计值）。
+    """
+
+    def __init__(self, ref_w=REF_W, roi_w=None, fps_hint=REF_FPS, window=512):
+        self.n = 0
+        self._t = np.empty(256)
+        self._dts = np.empty(256)
+        self.window_n = int(window)
+        self.med_dt = 1.0 / fps_hint
+        self.s = 1.0 if roi_w is None else roi_w / ref_w
+
+    @property
+    def t(self):
+        return self._t[: self.n]
+
+    @property
+    def dts(self):
+        return self._dts[: self.n]
+
+    def push(self, ts):
+        """追加一帧的时间戳（秒），返回它的帧号。时间戳必须不减（相等可以：dt 会钳到 1e-4）。"""
+        ts = float(ts)
+        if self.n and ts < self._t[self.n - 1]:
+            raise ValueError(f"时间戳倒退：{ts} < {self._t[self.n - 1]}")
+        if self.n == len(self._t):
+            self._t = np.concatenate([self._t, np.empty(len(self._t))])
+            self._dts = np.concatenate([self._dts, np.empty(len(self._dts))])
+        k = self.n
+        self._t[k] = ts
+        self.n += 1
+        if k:
+            self._dts[k] = ts - self._t[k - 1]
+            lo = max(1, self.n - self.window_n)
+            self.med_dt = float(np.median(self._dts[lo : self.n]))
+            if self.med_dt <= 0:
+                self.med_dt = 1e-4
+        else:
+            self._dts[k] = self.med_dt
+        return k
