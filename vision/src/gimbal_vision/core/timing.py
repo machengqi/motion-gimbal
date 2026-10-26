@@ -126,6 +126,8 @@ HZ_GOOD = 15.0
 HZ_MIN = 12.0
 """帧率低于 `HZ_MIN` 时不尝试跟踪：低帧率下一个时间窗里的信息量不够，
 指错的代价高于不指。具体阈值须在本项目数据上用帧率鲁棒性实验重新确定。"""
+HZ_TOL = 1e-6
+"""帧率比较的容差：24 Hz 素材隔帧取出的 12 Hz，`1 / (2/24)` 算出来是 11.999…，不能因此判为低于下限。"""
 
 
 class Clock:
@@ -205,9 +207,9 @@ class Clock:
     def ok(self):
         """这条时间轴能不能跑。返回 `(能不能, 说明)`。"""
         hz = self.hz()
-        if hz < HZ_MIN:
+        if hz < HZ_MIN - HZ_TOL:
             return False, f"帧率只有 {hz:.1f}Hz（下限 {HZ_MIN:.0f}Hz）—— 不尝试跟踪"
-        if hz < HZ_GOOD:
+        if hz < HZ_GOOD - HZ_TOL:
             return True, f"帧率 {hz:.1f}Hz 偏低（正常线 {HZ_GOOD:.0f}Hz），精度会下降"
         if self.jitter() > 1.6:
             return True, f"帧间隔抖动 {self.jitter():.2f}（1.0=均匀），精度会下降"

@@ -141,3 +141,13 @@ def test_the_gain_is_a_ratio_not_a_rate():
         ts = np.arange(5) / hz
         g = timing.Clock(5, ts=ts).gain(timing.GAIN_KEEP, 2)
         assert 0.0 < g < 1.0, f"{hz}Hz 增益 {g}"
+
+
+def test_frame_rate_guard_tolerates_float_error_at_the_boundary():
+    """24 Hz 素材隔帧取出的 12 Hz 恰在下限上，不能因浮点误差（1/(2/24) = 11.999…）判为过低。"""
+    ts = np.arange(60) * (2 / 24)
+    clk = timing.Clock(len(ts), ts)
+    assert clk.hz() < timing.HZ_MIN  # 浮点误差确实存在
+    assert clk.ok()[0]
+    slow = timing.Clock(40, np.arange(40) * (3 / 24))
+    assert not slow.ok()[0]
