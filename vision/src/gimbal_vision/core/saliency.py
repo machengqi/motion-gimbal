@@ -30,6 +30,12 @@
 - **过期撤回**（`stale`）：估计位置连续 `timing.STALE_SEC` 没有新证据就撤回成「无估计」，下一个
   候选直接接管，不再走远跳印证。防止首锁锁错之后，回跳印证一直凑不齐而永远停在错处。
 
+# 消融开关（只用于 docs/EXPERIMENTS.md 的消融对照；默认值即现行实现，逐位不变）
+
+- `excl="pos"`（默认）排除名单挂在背景系位置上；`"id"` 挂在轨迹 ID 上（被判静止的 tid 永久排除，
+  ID 一换就失效，也不会波及路过该位置的其他轨迹）；`"none"` 不用排除名单（`screenfix` 不受影响）。
+- `disp="net"`（默认）显著性用窗口内净位移；`"path"` 换成路程（窗口内逐帧位移长度之和），有效性条件不变。
+
 # 可选：排除图用单应传播（`warps`）
 
 默认的背景系是**平移**模型（画面坐标 − 累计背景位移）：相机旋转、变焦、景深视差时，离画面中心越远的
@@ -112,6 +118,22 @@ def net_disp(seq, k, tid, lo, need):
     return float(np.hypot(*(a[-1] - a[0])))
 
 
+def path_len(seq, k, tid, lo, need):
+    """背景系里一个时间窗内的**路程**（逐帧位移长度之和；消融用，见 `Selector(disp="path")`）。
+
+    有效性条件与 [`net_disp`] 完全相同，只换统计量。
+    """
+    pts = [p for p in seq.get(tid, []) if lo <= p[0] <= k]
+    if not pts or pts[-1][0] < k - 1 or len(pts) < need * 0.6 or pts[0][0] > lo + 2:
+        return None
+    a = np.array([[x, y] for _, x, y in pts])
+    return float(np.sum(np.hypot(*np.diff(a, axis=0).T))) if len(a) > 1 else 0.0
+
+
+EXCL_MODES = ("pos", "id", "none")
+DISP_MODES = ("net", "path")
+
+
 def spread(seq, k, tid, lo, need):
     """背景系里一个时间窗内**离自身重心最远**多少。观测不够返回 `None`。"""
     pts = [p for p in seq.get(tid, []) if lo <= p[0] <= k]
@@ -140,10 +162,21 @@ class Selector:
     """**逐帧喂跟踪结果，逐帧出「目标在哪」。** 状态全在这里，可在线使用。
 
     `screenfix` / `stale` 见模块文档；`shift_chal=False` 复现修复前的行为（印证中的远跳位置只在
-    下一次远跳时才随背景平移），只用于消融对照。
+    下一次远跳时才随背景平移），只用于消融对照。`excl` / `disp` 见模块文档的「消融开关」。
     """
 
-    def __init__(self, clock, roi, screenfix=True, stale=True, shift_chal=True, warps=None, warp_disp=False):
+    def __init__(
+        self, clock, roi, screenfix=True, stale=True, shift_chal=True, warps=None, warp_disp=False,
+        excl="pos", disp="net",
+    ):
+        if excl not in EXCL_MODES or disp not in DISP_MODES:
+            raise ValueError((excl, disp))
+        if warps is not None and (excl != "pos" or disp != "net"):
+            raise ValueError("单应传播只与默认的 excl / disp 组合")
+        self.excl_mode = excl
+        self.disp_mode = disp
+        self.banned_ids: set = set()
+        """`excl="id"` 时被排除的 tid。"""
         self.clk = clock
         self.warps = warps
         """逐帧单应（第 k−1 帧 → 第 k 帧，`None` 当单位阵）；给了就用单应传播排除图，见模块文档。"""
@@ -237,14 +270,18 @@ class Selector:
             return (v[0] + cum[0], v[1] + cum[1]) if warped else (v[0], v[1])
 
         for tid, v in hist[k][1].items():
-            if v[5] != 0:
+            if v[5] != 0 or self.excl_mode == "none":
                 continue
             if warped:
                 sp = self._spread_w(seq, hist, k, tid, lo_s, n_s)
             else:
                 sp = spread(seq, k, tid, lo_s, n_s)
             if sp is not None and sp < self.static_r:
-                new = self.excluded.mark(*loc(v))
+                if self.excl_mode == "id":
+                    new = tid not in self.banned_ids
+                    self.banned_ids.add(tid)
+                else:
+                    new = self.excluded.mark(*loc(v))
                 self.stats["mark_new" if new else "mark_merge"] += 1
 
         # ② 排除法 + 显著性
@@ -253,7 +290,13 @@ class Selector:
         for tid, v in hist[k][1].items():
             if v[5] != 0:
                 continue
-            if self.excluded.hit(*loc(v)):
+            if self.excl_mode == "id":
+                hit = tid in self.banned_ids
+            elif self.excl_mode == "none":
+                hit = False
+            else:
+                hit = self.excluded.hit(*loc(v))
+            if hit:
                 self.last_excluded.append(tid)
                 self.stats["excluded"] += 1
                 continue
@@ -261,6 +304,8 @@ class Selector:
                 continue
             if self.warp_disp:
                 d = self._net_disp_w(seq, hist, k, tid, lo_b, n_b)
+            elif self.disp_mode == "path":
+                d = path_len(seq, k, tid, lo_b, n_b)
             else:
                 d = net_disp(seq, k, tid, lo_b, n_b)
             if d is not None:

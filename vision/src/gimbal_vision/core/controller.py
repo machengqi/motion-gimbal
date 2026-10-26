@@ -35,7 +35,12 @@ from . import timing
 class Aim:
     """一条平滑的瞄准点轨迹。**逐帧喂，逐帧出** —— 可在线使用。"""
 
-    def __init__(self, clock):
+    def __init__(self, clock, limit="acc"):
+        """`limit="acc"`（默认）= 先限加速度再限速度（现行）；`"vel"` = 只限速度（同一速度上限、不限加速度），
+        只用于「限速度 vs 限加速度」的平滑性消融。"""
+        if limit not in ("acc", "vel"):
+            raise ValueError(limit)
+        self.limit = limit
         self.clk = clock
         self.pos = None  # 瞄准点（画面系）
         self.cvel = np.zeros(2)  # ⚠️ px/秒，不是「每帧位移」—— 帧长会变
@@ -77,12 +82,15 @@ class Aim:
             want = (np.array(target, dtype=float) - self.pos) * (clk.gain(timing.GAIN_KEEP, k) / dt)
 
         # ③ 限加速度，再限速度
-        dv_max = timing.AIM_ACC_PPS2 * clk.s * dt
-        dv = want - self.cvel
-        n = float(np.hypot(*dv))
-        if n > dv_max:
-            dv = dv / n * dv_max
-        self.cvel = self.cvel + dv
+        if self.limit == "vel":
+            self.cvel = np.array(want, dtype=float)
+        else:
+            dv_max = timing.AIM_ACC_PPS2 * clk.s * dt
+            dv = want - self.cvel
+            n = float(np.hypot(*dv))
+            if n > dv_max:
+                dv = dv / n * dv_max
+            self.cvel = self.cvel + dv
         v_max = timing.AIM_MAX_PPS * clk.s
         n = float(np.hypot(*self.cvel))
         if n > v_max:
